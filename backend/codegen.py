@@ -51,10 +51,13 @@ class CodeGenerator:
                 self._compile_function(decl)
 
         # 3) 生成顶层语句
+        last_line = 1
         for decl in program.declarations:
             if isinstance(decl, ast.Stmt):
                 self._stmt(decl)
-        self.current.emit(bc.OP_RETURN_NONE, None, 1)
+                last_line = getattr(decl, "line", last_line)
+        # 末尾隐式返回：使用最后一条语句的行号，避免哨兵指令错误地命中第 1 行断点
+        self.current.emit(bc.OP_RETURN_NONE, None, last_line)
 
         # 4) 字节码优化
         for fc in self.program.functions.values():
@@ -71,7 +74,12 @@ class CodeGenerator:
         # 收集函数体内（不含嵌套函数）的局部变量
         self._collect_locals(fn.body)
         self._stmt(fn.body)
-        self.current.emit(bc.OP_RETURN_NONE, None, fn.line)
+        # 末尾隐式返回：使用函数体最后一条语句的行号，避免哨兵指令错误命中
+        # 函数声明行上的断点
+        last_line = fn.line
+        if fn.body.statements:
+            last_line = getattr(fn.body.statements[-1], "line", fn.line)
+        self.current.emit(bc.OP_RETURN_NONE, None, last_line)
         self.current, self._locals = prev, prev_locals
         return fc
 

@@ -38,7 +38,19 @@ class Debugger:
         self.step_mode: Optional[str] = None   # None | 'instruction' | 'into' | 'over' | 'out'
         self._step_from_line = 0
         self._step_depth = 0
-        self._resume_line: Optional[int] = None
+        # 续跑"防自命中"状态：
+        #   _suppress/_suppress_frame/_suppress_line 在暂停时记录"原暂停位置"；
+        #   _hop_once 在发起继续/单步命令时置位，仅放行紧接着的第一条待执行指令
+        #   （即触发本次暂停的那条）。之后只要执行仍停留在"原暂停帧的同一源码行"
+        #   就继续放行；一旦该帧推进到下一行、跳入函数（帧变深）或从函数返回
+        #   （帧变浅），即恢复暂停能力。
+        # 一行内的多条字节码不会让断点自命中，而循环回边（先经过条件行）与函数
+        # 的重复调用都能再次正常命中断点。
+        self._hop_once = False
+        self._suppress = False
+        self._suppress_at_entry = False
+        self._suppress_frame = None
+        self._suppress_line = 0
         self.pause_reason: str = PAUSE_ENTRY
         self._just_started = True
 
@@ -46,7 +58,14 @@ class Debugger:
     # 断点管理
     # ------------------------------------------------------------------
     def set_breakpoints(self, lines: List[int]):
-        self.breakpoints = set(l for l in lines if isinstance(l, int) and l > 0)
+        new_bps = set(l for l in lines if isinstance(l, int) and l > 0)
+        # 断点集合发生变化属于显式用户操作：清除续跑抑制状态，否则上一次暂停
+        # 遗留的"同行放行"可能跳过用户新加在当前行上的断点
+        if new_bps != self.breakpoints:
+            self._suppress = False
+            self._suppress_at_entry = False
+            self._hop_once = False
+        self.breakpoints = new_bps
 
     def add_breakpoint(self, line: int):
         self.breakpoints.add(line)
@@ -63,41 +82,105 @@ class Debugger:
     # ------------------------------------------------------------------
     # 暂停判定（在每条指令执行前被 VM 调用）
     # ------------------------------------------------------------------
+    def _arm_suppression(self, vm, at_entry=False):
+        """记录暂停位置（帧 + 下一条待执行指令所在行），续跑时用于防自命中。
+
+        at_entry=True 表示暂停在尚未执行任何指令的入口断点：此时该行的全部
+        指令都还没执行过，续跑时应整行放行（不消费一次性放行），否则同一行
+        的第二条指令又会立刻命中断点。
+        """
+        self._suppress = True
+        self._suppress_at_entry = at_entry
+        fr = vm.frames[-1] if vm.frames else None
+        ins = vm.peek_instruction()
+        self._suppress_frame = fr
+        self._suppress_line = ins.line if ins else 0
+
+    def _begin_resume(self):
+        """发起继续 / 单步命令：下一条待执行指令（原暂停指令）放行一次。"""
+        if getattr(self, "_suppress_at_entry", False):
+            # 入口暂停：靠"同行抑制"放行整行，不需要额外的一次性放行
+            self._hop_once = False
+        else:
+            self._hop_once = True
+
+    def _still_suppressed(self, vm, ins) -> bool:
+        if not self._suppress:
+            return False
+        # 续跑后的第一次检查对应原暂停指令本身，直接放行（入口暂停除外）
+        if self._hop_once:
+            self._hop_once = False
+            return True
+        fr = vm.frames[-1] if vm.frames else None
+        # 帧已切换（进入被调函数 / 从函数返回），立即恢复暂停能力
+        if fr is not self._suppress_frame:
+            self._suppress = False
+            self._suppress_at_entry = False
+            return False
+        # 仍在原帧且下一条指令属于原暂停行：一行对应多条字节码，继续放行；
+        # 推进到别的源码行（顺序下一行 / 循环回边先经过条件行）则解除
+        if ins is not None and ins.line == self._suppress_line:
+            return True
+        self._suppress = False
+        self._suppress_at_entry = False
+        return False
+
+    def _stepping_suppressed(self, vm, ins) -> bool:
+        """步进命令专用抑制：仅放行原暂停指令一次；帧一旦切换（函数调用/返回）
+        立即解除，避免把"进入新函数的第一行"也误当作同一位置而放行。"""
+        if not self._suppress:
+            return False
+        if self._hop_once:
+            self._hop_once = False
+            return True
+        # 步进不做"同行多指令"放行：行级步进只看行号，指令级步进每条都停
+        self._suppress = False
+        self._suppress_at_entry = False
+        return False
+
     def should_pause(self, vm) -> bool:
         ins = vm.peek_instruction()
         if ins is None:
             return False
         if self.step_mode == "instruction":
+            # 放行原暂停指令恰好一次，随后无条件暂停（最细粒度，不按行合并）
+            if self._stepping_suppressed(vm, ins):
+                return False
             self.pause_reason = PAUSE_STEP
             return True
         if self.step_mode == "into":
+            if self._stepping_suppressed(vm, ins):
+                return False
             if ins.line != self._step_from_line:
                 self.pause_reason = PAUSE_STEP
                 return True
             return False
         if self.step_mode == "over":
-            if len(vm.frames) < self._step_depth and ins.line != self._step_from_line:
+            if self._stepping_suppressed(vm, ins):
+                return False
+            # 同帧换到下一行，或已从被调函数返回更浅帧，即暂停；进入更深帧不暂停
+            if len(vm.frames) <= self._step_depth and ins.line != self._step_from_line:
                 self.pause_reason = PAUSE_STEP
                 return True
             return False
         if self.step_mode == "out":
+            if self._stepping_suppressed(vm, ins):
+                return False
             if len(vm.frames) < self._step_depth:
                 self.pause_reason = PAUSE_STEP
                 return True
             return False
-        # 断点模式（step_mode is None）
-        if ins.line in self.breakpoints and ins.line != self._resume_line:
+        # 断点模式（step_mode is None）：抑制原暂停位置的自命中后正常判断
+        if self._still_suppressed(vm, ins):
+            return False
+        if ins.line in self.breakpoints:
             self.pause_reason = PAUSE_BREAKPOINT
             return True
-        if ins.line != self._resume_line:
-            self._resume_line = None
         return False
 
     def on_pause(self, vm):
-        """暂停发生后：记录续跑时需跳过的断点行，清除步进模式。"""
-        ins = vm.peek_instruction()
-        if ins is not None:
-            self._resume_line = ins.line + 1
+        """暂停发生后：续跑时先抑制原暂停位置，清除步进模式。"""
+        self._arm_suppression(vm, at_entry=False)
         self.step_mode = None
         self.pause_reason = vm.pause_reason if hasattr(vm, "pause_reason") and vm.pause_reason else self.pause_reason
 
@@ -112,6 +195,10 @@ class Debugger:
             # 若第一行就有断点，暂停在入口；否则直接运行
             if self._first_line_breakpoint():
                 self.pause_reason = PAUSE_BREAKPOINT
+                # 入口断点：该行尚未执行，续跑时整行放行，避免立即自命中
+                self._arm_suppression(self.vm, at_entry=True)
+                self.vm.paused = True
+                self.vm.pause_reason = PAUSE_BREAKPOINT
                 return
         self.continue_()
 
@@ -121,14 +208,16 @@ class Debugger:
 
     def continue_(self):
         self.step_mode = None
+        self._begin_resume()
         self.vm.paused = False
         self.vm.run(self.should_pause, self.on_pause)
 
     def step_instruction(self):
-        """单步一条指令。"""
+        """单步一条指令（放行当前暂停指令，下一条指令处暂停）。"""
         self.step_mode = "instruction"
+        self._begin_resume()
         self.vm.paused = False
-        self.vm.run(self.should_pause, self.on_pause, max_steps=1)
+        self.vm.run(self.should_pause, self.on_pause)
         self.step_mode = None
 
     def step_into(self):
@@ -148,6 +237,7 @@ class Debugger:
         self._step_from_line = ins.line if ins else 0
         self._step_depth = len(self.vm.frames)
         self.step_mode = mode
+        self._begin_resume()
         self.vm.paused = False
         self.vm.run(self.should_pause, self.on_pause)
 

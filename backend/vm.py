@@ -143,7 +143,7 @@ class VM:
     def current_position(self):
         if self.frames:
             fr = self.frames[-1]
-            return (fr.func_name, max(1, fr.current_line - 1))
+            return (fr.func_name, max(1, fr.current_line))
         return ("<main>", 0)
 
     def peek_instruction(self):
@@ -240,11 +240,10 @@ class VM:
                 self._name_error(ins, frame)
         elif op == bc.OP_STORE_VAR:
             v = s.pop()
-            if ins.operand in frame.locals:
-                frame.locals[ins.operand] = v
-                if frame.is_main:
-                    self.globals[ins.operand] = v
-            else:
+            # codegen 已按局部/全局归属选择指令：STORE_VAR 一律写入当前帧局部变量，
+            # main 帧的局部变量同时镜像到全局环境
+            frame.locals[ins.operand] = v
+            if frame.is_main:
                 self.globals[ins.operand] = v
         elif op == bc.OP_LOAD_GLOBAL:
             if ins.operand in self.globals:
