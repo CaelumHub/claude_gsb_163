@@ -141,9 +141,11 @@ class VM:
             self.profiler.begin_run()
 
     def current_position(self):
+        # current_line 由每条指令执行时写入，本身就是 1-based 源码行号，
+        # 直接返回（暂停时 IP 已预指向下一条，但 current_line 仍是最后执行的行）。
         if self.frames:
             fr = self.frames[-1]
-            return (fr.func_name, max(1, fr.current_line - 1))
+            return (fr.func_name, max(1, fr.current_line))
         return ("<main>", 0)
 
     def peek_instruction(self):
@@ -191,20 +193,26 @@ class VM:
         except VMRuntimeError as e:
             self._handle_runtime_error(e)
 
-    def run(self, pause_fn=None, on_pause=None, max_steps=None):
-        """持续执行直到 pause_fn 返回 True、程序结束、出错、或步数耗尽。"""
-        steps = 0
+    def run(self, pause_fn=None, on_pause=None):
+        """持续执行直到 pause_fn 返回 True、程序结束或出错。
+
+        暂停判定发生在"每条指令执行前"。``pause_fn`` 除 True/False 外，还可
+        在续跑后第一次被调用时返回 ``"arm"``：表示"当前位置这条指令先放行，
+        从再下一条起恢复正常判定"，从而避免在刚暂停的同一位置立刻再次暂停
+        （同一源码行对应多条指令时尤其需要）。
+        """
         while not self.finished and self.frames:
-            if pause_fn is not None and pause_fn(self):
-                self.paused = True
-                self.pause_reason = getattr(self.debugger, "pause_reason", "pause")
-                if on_pause is not None:
-                    on_pause(self)
-                return self
-            if max_steps is not None and steps >= max_steps:
-                return self
+            if pause_fn is not None:
+                verdict = pause_fn(self)
+                if verdict == "arm":
+                    pass  # 本轮放行当前指令，下一轮起恢复正常判定
+                elif verdict:
+                    self.paused = True
+                    self.pause_reason = getattr(self.debugger, "pause_reason", "pause")
+                    if on_pause is not None:
+                        on_pause(self)
+                    return self
             self.step_instruction()
-            steps += 1
             if self.paused:
                 return self
         return self

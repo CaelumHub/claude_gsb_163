@@ -336,7 +336,8 @@ class Service:
     def debug_start(self, source, breakpoints=None, pid=None, vid=None):
         """创建并启动一个调试会话（编译 -> 建 VM -> 建调试器 -> 启动）。"""
         sid = self._new_session_id()
-        sess = DebugSession(sid, source, [b + 1 for b in (breakpoints or [])], pid, vid)
+        # 前端行号槽与字节码 ins.line 同为 1-based 源码行号，直接透传，不可再偏移
+        sess = DebugSession(sid, source, list(breakpoints or []), pid, vid)
         self.debug_sessions[sid] = sess
         sess.start()
         return self.debug_state(sid)
